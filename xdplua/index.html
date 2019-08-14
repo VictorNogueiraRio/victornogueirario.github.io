@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="generator" content="pandoc">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+  <title>XDPLua</title>
+  <style type="text/css">code{white-space: pre;}</style>
+  <link rel="stylesheet" href="pandoc.css">
+  <!--[if lt IE 9]>
+    <script src="//cdnjs.cloudflare.com/ajax/libs/html5shiv/3.7.3/html5shiv-printshiv.min.js"></script>
+  <![endif]-->
+</head>
+<body>
+<h1 id="xdplua">XDPLua</h1>
+<h2 id="overview">Overview</h2>
+<p>The eXpress Data Path (XDP) is a relatively new feature introduced to the Linux kernel in 2016. It aims to create hooks as early as possible in the RX path (usally in the NIC driver), making packet processing in the Linux kernel much faster, as it is further illustrated in this <a href="https://dl.acm.org/citation.cfm?id=3281443">paper</a>.</p>
+<p>One of the key concepts in this project is <em>kernel scripting</em>. Kernel scripting is one of the many ways users can extend the OS. It uses scripting languages to taylor and customize the kernel as needed. Some of its key advantages over other solutions are that it increases productivity and allows users to implement more complex run-time configurations if compared to more traditional methods, such as merely choosing parameter values, as it is further described in this <a href="http://www.netbsd.org/~lneto/dls14.pdf">paper</a>.</p>
+<p>The use of kernel scripting in this project is made possible by <a href="https://github.com/luainkernel/lunatik">Lunatik</a>, which allows us to execute Lua scripts inside the Linux kernel.</p>
+<p>Other GSoC projects also made use of Lunatik, such as the <a href="https://github.com/caioluiz/lunatik">Lunatik RCU binding</a> and the <a href="https://github.com/tcz717/lunatik">Lunatik Socket Library</a>.</p>
+<p>Since Lua, in contrast to eBPF, is a full-fledged Turing-complete programming language, it may be more suited for implementing more complex programs that could be executed inside the XDP environment, such as network services as we will explore further as use cases below.</p>
+<p>XDPLua is a project, initially developed during Google Summer of Code 2019, that aims to allow users to load Lua scripts to be executed inside the XDP environment. Making it easier to execute more complex programs inside this environment.</p>
+<p>It is important to emphasize that the intent of the project is not to replace eBPF with Lua, but to use one to complement the other. One example where this could happen would be if we wanted to have a DNS server running in the express data path with layer 3 or 4 DDoS protection. As said before, since Lua is a full-fledged programming language, implementing the DNS server with it may be easier to do then with eBPF. However, as shown in the performace tests described later in this page, eBPF seems to be faster then Lua. So if the intent is to implement a simple and performance critical application, such as Layer 3 or 4 DDoS filters, eBPF may be a better alternative. Notice that other more complex performance critical use cases, such as a layer 7 DDoS filter, may be easier to implement in Lua.</p>
+<p>Regarding statefulness, what we are doing is creating one Lua State per CPU and using the <a href="https://github.com/caioluiz/lunatik">Lunatik RCU binding</a>. This way we are able to share information between different Lua States and avoid some syncronization issues.</p>
+<p>To load Lua scripts to the express data path we are using <a href="https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/tools/lib/bpf">libbpf</a>, however, in contrast to how BPF object files are loaded into the kernel, we are loading Lua scripts in plain text and not as a file descriptor. For now, we are able to load scripts with up to 8192 bytes.</p>
+<p>Another important detail is that we are using the Linux kernel version 5.2.0-rc2 for this project</p>
+<h2 id="use-cases">Use cases</h2>
+<p>To further explore the project we created a few use cases to illustrate other purposes that the express data path could have, aside from packet filtering. Two of the use cases we have implemented are a PoC version of a DNS server and an interface forwarding application.</p>
+<h3 id="dns-server">DNS server</h3>
+<p>The DNS server that was implemented is really simple and just a proof of concept. It only responds to A type DNS requests. It tries to respond DNS requests in one specific interface, if it doesn't have the IPv4 address corresponding to the domain in the request, it let's the request pass through to another DNS server.</p>
+<pre><code>if querytype ~= ipv4type then
+    return xdp.action.pass
+end
+
+if rcu[domain] then
+    ...
+
+    xdplua.udp_reply(answer, answeroffset + totoff)
+
+    return xdp.action.tx
+end
+
+return xdp.action.pass</code></pre>
+<p>When this other DNS server responds, our server captures the IPv4 address from the response (if there is any) and caches it.</p>
+<pre><code>if answer.type == ipv4type then
+    local ip = answer.ipv4
+    rcu[domain] = ip
+end</code></pre>
+<p>This use case is available in <a href="https://github.com/VictorNogueiraRio/linux/tree/dnsserver">here</a>.</p>
+<h3 id="interface-forwarding">Interface forwarding</h3>
+<p>The interface forwarding case uses the XDP redirect feature which makes it possible to send packets from one network interface to another. It also makes use of a user space program called XDPLuatables, which lets the user write in commands to redirect packets coming from one interface to another. The program lets the user specify which packets it wants to redirect, by supplying the packet's layer 3 and 4 information, and to which IP it wishes to redirect it. It also makes it possible to change the packet's mac and ip source address.</p>
+<p>One example where we could use this application would be if we wanted to redirect all udp traffic arriving at interface <em>eth0</em> that is destined to ip <em>10.0.0.2</em> on port 2222 to destination address <em>192.168.0.1</em> on port 53.</p>
+<p>That XDPLuatables command that would enable this would be:</p>
+<pre><code>./xdpluatables -d 10.0.0.2 --dport 2222 -p udp --to-destination 192.168.0.1:53 eth0</code></pre>
+<p>It is important to emphasize that this use case, although it has already a minimally funcional implementation, is more of an idea at this stage. It still needs improvement.</p>
+<p>This use case is available in <a href="https://github.com/VictorNogueiraRio/linux/tree/forwarding">here</a>.</p>
+<h2 id="versions">Versions</h2>
+<p>In this project we developed two versions of XDPLua, one using it as an eBPF helper, and the other binding it with XDP's core implementation. Each version is in a specific branch(<a href="https://github.com/VictorNogueiraRio/linux/tree/xdp_lua_helper_version">helper version</a> or <a href="https://github.com/VictorNogueiraRio/linux/tree/xdp_lua_core_version">core version</a>) inside the <a href="https://github.com/VictorNogueiraRio/linux">github repository</a> where the project was developed. An important detail is that both versions of XDPLua only execute Lua scripts inside the XDP generic hook.</p>
+<h3 id="helper-version">Helper version</h3>
+<p>The helper version essentiallly uses a BPF helper which receives a function name and a struct xdp_buff, which contains the incoming packet. This BPF helper then runs the function and passes the packet as a parameter in the form of a Lua data userdata.</p>
+<p>To use this version, first go to the samples/bpf directory and run make.</br></br> After running make, the xdplua command line utility will be generated.</p>
+<p>To load a Lua script into the XDP environment run:</p>
+<pre><code>./xdplua -L &lt;lua_script_path&gt; &lt;network_interface_name&gt;</code></pre>
+<p>It is important to mention that you must name the Lua function which will be called when the packet arrives as <em>callback</em>.</p>
+<p>This function will receive as an argument the packet that has arrived. This packet will be received in the form of a Lua data userdata, so that it can be easier to manipulate in Lua. For more information about how to manipulate packets in the form of this userdata checkout the examples in the Lua data <a href="https://github.com/lneto/luadata">github repository</a>.</p>
+<p>After that, everytime a packet arrives at the network interface you passed as an argument, the Lua script you also passed as an argument will be run.</p>
+<p>To detach the script run:</p>
+<pre><code>./xdplua -d &lt;network_interface_name&gt;</code></pre>
+<h3 id="core-version">Core version</h3>
+<p>This version is more instrusive and changes a part of the XDP's core implementation to allow the execution of both Lua scripts and eBPF programs. Instead of passing a function name to be executed inside an eBPF program that calls a helper function, the function name is stored as a field inside <em>struct net_device</em>, as are eBPF programs.</p>
+<p>To use this version, first go to the samples/bpf directory and run make.</br></br> After running make, the xdplua command line utility will be generated.</p>
+<p>To load the Lua script run:</p>
+<pre><code>./xdplua -L &lt;lua_script_path&gt; -F &lt;function_to_execute&gt; &lt;network_interface_name&gt;</code></pre>
+<p>You can also just run:</p>
+<pre><code>./xdplua -F &lt;function_to_execute&gt; &lt;network_interface_name&gt;</code></pre>
+<p>to change the name of the function you want to be executed inside the Lua script.</p>
+<p>To detach the script run:</p>
+<pre><code>./xdplua -d &lt;network_interface_name&gt;</code></pre>
+<h2 id="performance">Performance</h2>
+<p>We attempted some benchmarks using XDPLua and comparing the results with those of eBPF and iptables. As we were limited to a 1Gb/s network, the results weren't very fruitful. You can see the test results, along with a description of how they were reached <a href="https://github.com/VictorNogueiraRio/XDPLuaBenchmarks/tree/master/Benchmarks">here</a>.</p>
+<h2 id="installation">Installation</h2>
+<p>To install XDPLua you will need to clone this <a href="https://github.com/VictorNogueiraRio/linux">github repository</a>, which is basically a modified version of the Linux kernel. After that pick the version you wish to use and compile the kernel using the following command:</p>
+<pre><code>make CONFIG_LUNATIK=y CONFIG_LUADATA=y CONFIG_XDPLUA=y</code></pre>
+<p>After that follow the instructions to reinstall the kernel for your specific distro. If, for example, you are using Arch Linux, the instructions will be <a href="https://wiki.archlinux.org/index.php/Kernel/Traditional_compilation">here</a>.</p>
+<p>Please note that If you wish to use one of the versions used for DDoS tests, Luaunpack is being used instead of Luadata. So you should compile the kernel using this other command:</p>
+<pre><code>make CONFIG_LUNATIK=y CONFIG_LUAUNPACK=y CONFIG_XDPLUA=y</code></pre>
+</body>
+</html>
